@@ -32,9 +32,15 @@ def obtener_datos_ckan(resource_id, base_url="https://datos.gob.cl/api/3/action"
             records.extend(response_records.json()["result"]["records"])
 
         # Crear el DataFrame
-        #df = pd.DataFrame(records)
-        #return df
-        return records
+        df = pd.DataFrame(records)
+
+        # Convertir "NULL" a None en el DataFrame
+        df = df.replace("NULL", None)
+        
+        # Eliminar duplicados basados en 'Placa'
+        df = df.drop_duplicates(subset=['Placa'])
+
+        return df
 
     except requests.RequestException as e:
         print(f"Error al obtener datos de CKAN: {e}")
@@ -44,11 +50,101 @@ def obtener_datos_ckan(resource_id, base_url="https://datos.gob.cl/api/3/action"
         print(f"Error al procesar la respuesta: {e}")
         #return pd.DataFrame()
         return None
+    
+def obtener_vehiculos_existentes(cursor):
+    """Obtiene los registros existentes en la tabla VEHICULO."""
+    cursor.execute("SELECT * FROM VEHICULO")
+    #return cursor.fetchall()
+    return {record['Placa']: record for record in cursor.fetchall()}
 
+def registrosDiferentes(record_db, record_ckan):
+    """Compara dos registros y determina si son diferentes."""
+    keys = ['Placa', 'Año', 'Num_Puertas', 'Cilindrada', 'ID_Modelo', 'ID_TCombustible', 'ID_Color', 'ID_TVehiculo', 'ID_Equipamiento', 'ID_Transmision']
+    for key in keys:
+        if record_db.get() != record_ckan.get(key):
+            return True
+    return False
+
+def obtener_id(cursor, tabla, nombre, valor):
+    """Obtiene el ID de una tabla dado un valor específico, insertando el valor si no existe."""
+    cursor.execute(f"SELECT {nombre} FROM {tabla} WHERE Nombre = '{valor}';")
+    result = cursor.fetchone()
+    if result:
+        return result[f"{nombre}"]
+    else:
+        cursor.execute(f"INSERT INTO {tabla} (Nombre) VALUES ('{valor}');")
+        return cursor.lastrowid
+
+def updateVehiculo(conn, cursor, df):
+    # Insertar o actualizar los datos de vehiculos en la tabla vehiculo
+    try:
+        registrosExistentes = obtener_vehiculos_existentes(cursor)
+        #registrosExistentesDict = {v['Placa']: v for v in registrosExistentes}
+
+        for index, record in df.iterrows():
+            placa = record.get('Placa', None)
+            print(placa)
+            if placa:
+                # Obtener o insertar las llaves foráneas necesarias
+                idModelo = obtener_id(cursor, "MODELO", "ID_Modelo", record.get('Modelo'))
+                idTCombustible = obtener_id(cursor, "TIPO_COMBUSTIBLE", "ID_TCombustible", record.get('Tipo Combustible')) if record.get('Tipo Combustible') else None
+                idColor = obtener_id(cursor, "COLOR", "ID_Color", record.get('Color'))
+                idTVehiculo = obtener_id(cursor, "TIPO_VEHICULO", "ID_TVehiculo", record.get('Tipo Vehiculo'))
+                idEquipamiento = obtener_id(cursor, "EQUIPAMIENTO", "ID_Equipamiento", record.get('Equipamiento')) if record.get('Equipamiento') else None
+                idTransmision = obtener_id(cursor, "TRANSMISION", "ID_Transmision", record.get('Transmisión')) if record.get('Transmisión') else None
+
+                record['ID_Modelo'] = idModelo
+                record['ID_TCombustible'] = idTCombustible
+                record['ID_Color'] = idColor
+                record['ID_TVehiculo'] = idTVehiculo
+                record['ID_Equipamiento'] = idEquipamiento
+                record['ID_Transmision'] = idTransmision
+
+                if placa in registrosExistentes:
+                    if registrosDiferentes(registrosExistentes[placa], record):
+                        query = """
+                        UPDATE VEHICULO SET
+                            Año = %s, Num_Puertas = %s, Cilindrada = %s,
+                            ID_Modelo = %s, ID_TCombustible = %s, ID_Color = %s, ID_TVehiculo = %s,
+                            ID_Equipamiento = %s, ID_Transmision = %s
+                        WHERE Placa = %s
+                        """
+                        cursor.execute(query, (
+                            record.get('Año Vehículo'), record.get('Numero Puertas'),
+                            record.get('Cilindrada') if record.get('Cilindrada') else None, idModelo, idTCombustible, idColor,
+                            idTVehiculo, idEquipamiento, idTransmision, placa
+                        ))
+                        print("dede")
+                else:
+                    query = """
+                    INSERT INTO VEHICULO (Placa, Año, Num_Puertas, Cilindrada,
+                                        ID_Modelo, ID_TCombustible, ID_Color, ID_TVehiculo,
+                                        ID_Equipamiento, ID_Transmision)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(query, (
+                        placa, record.get('Año Vehículo'), record.get('Numero Puertas'),
+                        record.get('Cilindrada') if record.get('Cilindrada') else None, idModelo, idTCombustible, idColor,
+                        idTVehiculo, idEquipamiento, idTransmision
+                    ))
+                 # Añadir la placa a vehiculos_existentes para futuras verificaciones
+                registrosExistentes[placa] = record
+
+        conn.commit()
+        print("Datos de vehículos insertados/actualizados correctamente.")
+
+    except mysql.connector.Error as e:
+        conn.rollback()
+        print(f"Error de MySQL: {e}")
+    
+    #except Exception as e:
+        conn.rollback()
+        print(f"Error: {e}")
+  
 def main():
     try:
         conn = mysql.connector.connect(**config)
-        cursor = conn.cursor()
+        cursor = conn.cursor(dictionary=True) #Para obtener resultados como diccionarios
 
         # 2. Crear base de datos si no existe
         DB_NAME = "PRUEBA"
@@ -57,8 +153,8 @@ def main():
         conn.database = DB_NAME
 
         # Ejecutar cada script para crear las tablas
-        for sql_query in renovate:
-            cursor.execute(sql_query)
+        for query in renovate:
+            cursor.execute(query)
         '''
         for command in renovate:
             for result in cursor.execute(command, multi=True):
@@ -72,11 +168,18 @@ def main():
         #record = cursor.fetchall()
         '''
         
-        # Llamar a la función para obtener registros de CKAN
         resource_id = "a95bcfb6-3800-4931-8e52-e0862417c058"
-        records = obtener_datos_ckan(resource_id)
-        for record in records:
-            print(record)
+        df = obtener_datos_ckan(resource_id)
+
+        if df is not None:
+            # Insertar o actualizar registros en la tabla Vehiculo
+            updateVehiculo(conn, cursor, df)
+
+        # Llamar a la función para obtener registros de CKAN
+        #resource_id = "a95bcfb6-3800-4931-8e52-e0862417c058"
+        #records = obtener_datos_ckan(resource_id)
+        #for record in records:
+        #    print(record)
 
         #if records:
         #    # Insertar registros en la tabla VEHICULO
@@ -92,8 +195,8 @@ def main():
     except mysql.connector.Error as e:
         print(f"Error de MySQL: {e}")
 
-    except Exception as e:
-        print(f"Error: {e}")
+    #except Exception as e:
+    #    print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
